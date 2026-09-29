@@ -1,0 +1,937 @@
+diff --git a/lib/natural/classifiers/index.d.ts b/lib/natural/classifiers/index.d.ts
+index f05c8c7..7bacb7d 100644
+--- a/lib/natural/classifiers/index.d.ts
++++ b/lib/natural/classifiers/index.d.ts
+@@ -2,6 +2,7 @@ import events from 'events'
+ import type { Corpus, Sentence } from '../brill_pos_tagger'
+ import type { Stemmer } from '../stemmers'
+ import type { StorageBackend } from '../util'
++import type { LanguageModel, LanguageModelJSON, LanguageModelMode, LanguageModelOptions } from '../language_model'
+ 
+ // Start apparatus declarations
+ 
+@@ -93,8 +94,7 @@ declare class ClassifierBase extends events.EventEmitter {
+   setOptions (options: ClassifierOptions): void
+   save (filename: string, callback?: ClassifierCallback): void
+   static load (filename: string, stemmer: Stemmer | null | undefined, callback: ClassifierCallback): void
+-  saveTo (storage: StorageBackend): string
+-  static loadFrom (storage: StorageBackend): ClassifierBase
++  saveTo (storage: StorageBackend): Promise<string>
+ 
+   Threads: any
+   trainParallel (numThreads: number, callback: ParallelTrainerCallback): void
+@@ -110,8 +110,8 @@ export class BayesClassifier extends ClassifierBase {
+   constructor (stemmer?: Stemmer, smoothing?: number)
+   static load (filename: string, stemmer: Stemmer | null | undefined, callback: BayesClassifierCallback): void
+   static restore (classifier: Record<string, unknown>, stemmer?: Stemmer): BayesClassifier
+-  saveTo (storage: StorageBackend): string
+-  static loadFrom (storage: StorageBackend): ClassifierBase
++  saveTo (storage: StorageBackend): Promise<string>
++  static loadFrom (key: string, stemmer: Stemmer | null | undefined, storage: StorageBackend): Promise<BayesClassifier>
+ }
+ 
+ declare type LogisticRegressionClassifierCallback = (err: NodeJS.ErrnoException | null, classifier?: LogisticRegressionClassifier) => void
+@@ -120,8 +120,44 @@ export class LogisticRegressionClassifier extends ClassifierBase {
+   constructor (stemmer?: Stemmer)
+   static load (filename: string, stemmer: Stemmer | null | undefined, callback: LogisticRegressionClassifierCallback): void
+   static restore (classifier: Record<string, unknown>, stemmer?: Stemmer): LogisticRegressionClassifier
+-  saveTo (storage: StorageBackend): string
+-  static loadFrom (storage: StorageBackend): ClassifierBase
++  saveTo (storage: StorageBackend): Promise<string>
++  static loadFrom (key: string, stemmer: Stemmer | null | undefined, storage: StorageBackend): Promise<LogisticRegressionClassifier>
++}
++
++declare interface LanguageModelClassifierOptions extends ClassifierOptions, LanguageModelOptions {}
++
++declare interface LanguageModelClassifierDoc {
++  label: string
++  text: string[]
++}
++
++declare interface LanguageModelClassifierJSON {
++  options: { n: number, discount: number, mode: LanguageModelMode }
++  keepStops: boolean
++  docs: LanguageModelClassifierDoc[]
++  features: Record<string, number>
++  lastAdded: number
++  models: Array<[string, LanguageModelJSON]>
++}
++
++declare type LanguageModelClassifierCallback = (err: NodeJS.ErrnoException | null, classifier?: LanguageModelClassifier) => void
++
++/**
++ * Classifier with one Kneser-Ney language model per label. Text is not stemmed: the stemmer
++ * argument only exists for compatibility with the other classifiers.
++ */
++export class LanguageModelClassifier extends ClassifierBase {
++  readonly options: { readonly n: number, readonly discount: number, readonly mode: LanguageModelMode }
++  models: Map<string, LanguageModel>
++
++  constructor (stemmer?: Stemmer | null, options?: LanguageModelClassifierOptions)
++  setOptions (options: LanguageModelClassifierOptions): void
++  tokenize (text: string): string[]
++  toJSON (): LanguageModelClassifierJSON
++  static restore (classifier: LanguageModelClassifierJSON, stemmer?: Stemmer | null): LanguageModelClassifier
++  static load (filename: string, stemmer: Stemmer | null | undefined, callback: LanguageModelClassifierCallback): void
++  saveTo (storage: StorageBackend): Promise<string>
++  static loadFrom (key: string, stemmer: Stemmer | null | undefined, storage: StorageBackend): Promise<LanguageModelClassifier>
+ }
+ 
+ declare type MaxEntClassifierCallback = (err: NodeJS.ErrnoException | null, classifier?: MaxEntClassifier) => void
+diff --git a/lib/natural/classifiers/index.js b/lib/natural/classifiers/index.js
+index a5fb250..b0bf773 100644
+--- a/lib/natural/classifiers/index.js
++++ b/lib/natural/classifiers/index.js
+@@ -24,6 +24,7 @@ THE SOFTWARE.
+ 
+ exports.BayesClassifier = require('./bayes_classifier')
+ exports.LogisticRegressionClassifier = require('./logistic_regression_classifier')
++exports.LanguageModelClassifier = require('./language_model_classifier')
+ 
+ exports.MaxEntClassifier = require('./maxent/Classifier')
+ exports.Context = require('./maxent/Context')
+diff --git a/lib/natural/classifiers/language_model_classifier.js b/lib/natural/classifiers/language_model_classifier.js
+new file mode 100644
+index 0000000..49a4cc1
+--- /dev/null
++++ b/lib/natural/classifiers/language_model_classifier.js
+@@ -0,0 +1,266 @@
++/*
++Copyright (c) 2025
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++THE SOFTWARE.
++*/
++
++'use strict'
++
++const Classifier = require('./classifier')
++const LanguageModel = require('../language_model/language_model')
++
++const MODEL_OPTION_KEYS = ['n', 'discount', 'mode']
++
++// Validates language model options and returns the normalised values
++function readModelOptions (options) {
++  const model = new LanguageModel(options)
++  return { n: model.n, discount: model.discount, mode: model.mode }
++}
++
++function sameTokens (a, b) {
++  if (a.length !== b.length) {
++    return false
++  }
++  for (let i = 0; i < a.length; i++) {
++    if (a[i] !== b[i]) {
++      return false
++    }
++  }
++  return true
++}
++
++function compareLabels (a, b) {
++  const left = String(a)
++  const right = String(b)
++  if (left < right) {
++    return -1
++  }
++  return left > right ? 1 : 0
++}
++
++// Classifier that trains one Kneser-Ney language model per label and classifies text by the
++// posterior probability of each label (the label's prior times the probability of the text
++// under the label's model). Unlike the other classifiers, text is not stemmed: the stemmer
++// argument is accepted for API compatibility only and tokens are used as they are.
++class LanguageModelClassifier extends Classifier {
++  // options: { n, discount, mode } (see LanguageModel) plus the base keepStops option
++  constructor (stemmer, options) {
++    super(null, stemmer)
++    this.features = Object.create(null)
++    this.options = readModelOptions(options)
++    this.models = new Map()
++  }
++
++  // n, discount and mode can be set until the classifier is trained; mode can only be set while
++  // no documents have been added, because documents are tokenised when they are added.
++  setOptions (options) {
++    if (options === null || typeof options !== 'object') {
++      throw new TypeError('options must be an object')
++    }
++    super.setOptions(options)
++    const requested = {}
++    let changed = false
++    for (const key of MODEL_OPTION_KEYS) {
++      if (options[key] !== undefined) {
++        requested[key] = options[key]
++        changed = true
++      }
++    }
++    if (!changed) {
++      return
++    }
++    if (this.models.size > 0) {
++      throw new Error('n, discount and mode cannot be changed after training; create a new classifier instead')
++    }
++    const next = readModelOptions(Object.assign({}, this.options, requested))
++    if (next.mode !== this.options.mode && this.docs.length > 0) {
++      throw new Error('mode cannot be changed once documents have been added')
++    }
++    this.options = next
++  }
++
++  tokenize (text) {
++    return LanguageModel.tokenize(text, this.options.mode)
++  }
++
++  toTokens (text) {
++    if (typeof text === 'string') {
++      return this.tokenize(text)
++    }
++    if (Array.isArray(text)) {
++      for (const token of text) {
++        if (typeof token !== 'string') {
++          throw new TypeError('text must be a string or an array of strings')
++        }
++      }
++      return text.slice()
++    }
++    throw new TypeError('text must be a string or an array of strings')
++  }
++
++  addDocument (text, classification) {
++    // Ignore further processing if classification is undefined
++    if (typeof classification === 'undefined') {
++      return
++    }
++    if (typeof classification === 'string') {
++      classification = classification.trim()
++    }
++    const tokens = this.toTokens(text)
++    if (tokens.length === 0) {
++      // ignore empty documents
++      return
++    }
++    this.docs.push({ label: classification, text: tokens })
++    for (const token of tokens) {
++      this.features[token] = (this.features[token] || 0) + 1
++    }
++  }
++
++  // Removes the last document with the given text and label. Trained models are not changed
++  // until retrain() is called.
++  removeDocument (text, classification) {
++    if (typeof classification === 'string') {
++      classification = classification.trim()
++    }
++    const tokens = this.toTokens(text)
++    let position = -1
++    for (let i = 0; i < this.docs.length; i++) {
++      const doc = this.docs[i]
++      if (doc.label === classification && sameTokens(doc.text, tokens)) {
++        position = i
++      }
++    }
++    if (position === -1) {
++      return
++    }
++    this.docs.splice(position, 1)
++    for (const token of tokens) {
++      if (this.features[token] > 1) {
++        this.features[token]--
++      } else {
++        delete this.features[token]
++      }
++    }
++    if (position < this.lastAdded) {
++      this.lastAdded--
++    }
++  }
++
++  // Trains the models with the documents added since the last call
++  train () {
++    const totalDocs = this.docs.length
++    const updated = new Set()
++    for (let i = this.lastAdded; i < totalDocs; i++) {
++      const doc = this.docs[i]
++      let model = this.models.get(doc.label)
++      if (model === undefined) {
++        model = new LanguageModel(this.options)
++        this.models.set(doc.label, model)
++      }
++      model.addSentence(doc.text)
++      updated.add(model)
++      this.emit('trainedWithDocument', { index: i, total: totalDocs, doc })
++      this.lastAdded++
++    }
++    for (const model of updated) {
++      model.train()
++    }
++    this.emit('doneTraining', true)
++  }
++
++  retrain () {
++    this.models = new Map()
++    this.lastAdded = 0
++    this.train()
++  }
++
++  // Returns [{ label, value }] sorted by decreasing value, where value is the posterior
++  // probability of the label. Ties are broken by label.
++  getClassifications (observation) {
++    const tokens = this.toTokens(observation)
++    if (this.models.size === 0) {
++      return []
++    }
++    let totalSentences = 0
++    for (const model of this.models.values()) {
++      totalSentences += model.sentences.length
++    }
++    const scores = []
++    let max = -Infinity
++    for (const [label, model] of this.models) {
++      const score = Math.log(model.sentences.length / totalSentences) + model.logProbability(tokens)
++      scores.push({ label, score })
++      max = Math.max(max, score)
++    }
++    const weights = scores.map(entry => (max === -Infinity ? 1 : Math.exp(entry.score - max)))
++    const sum = weights.reduce((total, weight) => total + weight, 0)
++    return scores
++      .map((entry, i) => ({ label: entry.label, value: weights[i] / sum }))
++      .sort((a, b) => (b.value - a.value) || compareLabels(a.label, b.label))
++  }
++
++  classify (observation) {
++    const classifications = this.getClassifications(observation)
++    return classifications.length > 0 ? classifications[0].label : undefined
++  }
++
++  toJSON () {
++    return {
++      options: Object.assign({}, this.options),
++      keepStops: !!this.keepStops,
++      docs: this.docs.map(doc => ({ label: doc.label, text: doc.text.slice() })),
++      // Spread defines own properties, so a feature called '__proto__' survives the copy
++      features: { ...this.features },
++      lastAdded: this.lastAdded,
++      models: Array.from(this.models, ([label, model]) => [label, model.toJSON()])
++    }
++  }
++
++  // Builds an independent classifier from the output of toJSON()
++  static restore (classifier, stemmer) {
++    if (classifier === null || typeof classifier !== 'object' ||
++        !Array.isArray(classifier.docs) || !Array.isArray(classifier.models)) {
++      throw new TypeError('classifier must be an object created by LanguageModelClassifier#toJSON')
++    }
++    const restored = new LanguageModelClassifier(stemmer, classifier.options)
++    restored.keepStops = !!classifier.keepStops
++    restored.docs = classifier.docs.map(doc => ({ label: doc.label, text: restored.toTokens(doc.text) }))
++    restored.features = Object.assign(Object.create(null), classifier.features)
++    restored.lastAdded = Number.isInteger(classifier.lastAdded) ? classifier.lastAdded : 0
++    restored.models = new Map(classifier.models.map(([label, json]) => [label, LanguageModel.restore(json)]))
++    return restored
++  }
++
++  static load (filename, stemmer, callback) {
++    Classifier.load(filename, stemmer, function (err, classifier) {
++      if (err) {
++        return callback(err)
++      }
++      callback(err, LanguageModelClassifier.restore(classifier, stemmer))
++    })
++  }
++
++  static async loadFrom (key, stemmer, storageBackend) {
++    const classifier = await Classifier.loadFrom(key, storageBackend)
++    return LanguageModelClassifier.restore(classifier, stemmer)
++  }
++}
++
++module.exports = LanguageModelClassifier
+diff --git a/lib/natural/index.d.ts b/lib/natural/index.d.ts
+index 3637fad..5b0b726 100644
+--- a/lib/natural/index.d.ts
++++ b/lib/natural/index.d.ts
+@@ -26,6 +26,7 @@ export * from './brill_pos_tagger'
+ export * from './classifiers'
+ export * from './distance'
+ export * from './inflectors'
++export * from './language_model'
+ export * from './ngrams'
+ export * from './normalizers'
+ export * from './phonetics'
+diff --git a/lib/natural/index.js b/lib/natural/index.js
+index f88d7cc..b66ad57 100644
+--- a/lib/natural/index.js
++++ b/lib/natural/index.js
+@@ -37,6 +37,7 @@ module.exports = buildExportMap([
+   require('./classifiers'),
+   require('./distance'),
+   require('./inflectors'),
++  require('./language_model'),
+   require('./ngrams'),
+   require('./normalizers'),
+   require('./phonetics'),
+diff --git a/lib/natural/language_model/index.d.ts b/lib/natural/language_model/index.d.ts
+new file mode 100644
+index 0000000..073f00d
+--- /dev/null
++++ b/lib/natural/language_model/index.d.ts
+@@ -0,0 +1,62 @@
++/*
++Copyright (c) 2025
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++THE SOFTWARE.
++*/
++
++export type LanguageModelMode = 'word' | 'character'
++
++export interface LanguageModelOptions {
++  /** Order of the model (default 3) */
++  n?: number
++  /** Kneser-Ney discount between 0 and 1 (default 0.75) */
++  discount?: number
++  /** How strings are split into tokens (default 'word') */
++  mode?: LanguageModelMode
++}
++
++export interface LanguageModelJSON {
++  n: number
++  discount: number
++  mode: LanguageModelMode
++  trained: boolean
++  sentences: string[][]
++}
++
++export declare class LanguageModel {
++  static readonly START_SYMBOL: string
++  static readonly END_SYMBOL: string
++
++  readonly n: number
++  readonly discount: number
++  readonly mode: LanguageModelMode
++  readonly sentences: ReadonlyArray<readonly string[]>
++  readonly trained: boolean
++
++  constructor (options?: LanguageModelOptions)
++  static tokenize (text: string, mode?: LanguageModelMode): string[]
++  tokenize (text: string): string[]
++  addSentence (sentence: string | string[]): boolean
++  train (): void
++  probability (word: string, context?: string[]): number
++  logProbability (sentence: string | string[]): number
++  vocabulary (): string[]
++  toJSON (): LanguageModelJSON
++  static restore (json: LanguageModelJSON): LanguageModel
++}
+diff --git a/lib/natural/language_model/index.js b/lib/natural/language_model/index.js
+new file mode 100644
+index 0000000..7e782ce
+--- /dev/null
++++ b/lib/natural/language_model/index.js
+@@ -0,0 +1,25 @@
++/*
++Copyright (c) 2025
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++THE SOFTWARE.
++*/
++
++'use strict'
++
++exports.LanguageModel = require('./language_model')
+diff --git a/lib/natural/language_model/language_model.js b/lib/natural/language_model/language_model.js
+new file mode 100644
+index 0000000..5a120c2
+--- /dev/null
++++ b/lib/natural/language_model/language_model.js
+@@ -0,0 +1,324 @@
++/*
++Copyright (c) 2025
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++THE SOFTWARE.
++*/
++
++'use strict'
++
++const WordTokenizer = require('../tokenizers/regexp_tokenizer').WordTokenizer
++
++// Interpolated Kneser-Ney n-gram language model.
++//
++// Sentences are padded with n - 1 start symbols and one end symbol. Every n-gram of the padded
++// sentences is counted. The lower-order distributions use continuation counts (the number of
++// distinct left extensions of an n-gram), derived from the counts of the next higher order.
++// The unigram distribution is interpolated with a uniform distribution over the vocabulary plus
++// one slot for unknown words, so every word has a non-zero probability once the model is trained.
++
++const START_SYMBOL = '<s>'
++const END_SYMBOL = '</s>'
++const MODES = ['word', 'character']
++const DEFAULT_N = 3
++const DEFAULT_DISCOUNT = 0.75
++
++const wordTokenizer = new WordTokenizer()
++
++// A node of a count trie. `count` is the number of times the n-gram that ends at this node was
++// observed and `total` is the sum of the counts of its children, i.e. how often the sequence that
++// ends here was observed as a context.
++class CountNode {
++  constructor () {
++    this.count = 0
++    this.total = 0
++    this.children = new Map()
++  }
++}
++
++// Trie of token sequences that all have the same length.
++class CountTrie {
++  constructor () {
++    this.root = new CountNode()
++  }
++
++  add (ngram) {
++    let parent = this.root
++    let node = this.root
++    for (const token of ngram) {
++      parent = node
++      node = parent.children.get(token)
++      if (node === undefined) {
++        node = new CountNode()
++        parent.children.set(token, node)
++      }
++    }
++    node.count++
++    parent.total++
++  }
++
++  find (tokens) {
++    let node = this.root
++    for (const token of tokens) {
++      node = node.children.get(token)
++      if (node === undefined) {
++        return undefined
++      }
++    }
++    return node
++  }
++
++  // Yields every sequence stored in the trie
++  * sequences () {
++    yield * walk(this.root, [])
++  }
++}
++
++function * walk (node, prefix) {
++  if (node.children.size === 0) {
++    if (prefix.length > 0) {
++      yield prefix.slice()
++    }
++    return
++  }
++  for (const [token, child] of node.children) {
++    prefix.push(token)
++    yield * walk(child, prefix)
++    prefix.pop()
++  }
++}
++
++function normaliseOptions (options) {
++  if (options === undefined || options === null) {
++    options = {}
++  }
++  if (typeof options !== 'object') {
++    throw new TypeError('options must be an object')
++  }
++  const n = options.n === undefined ? DEFAULT_N : options.n
++  if (!Number.isInteger(n) || n < 1) {
++    throw new RangeError('n must be an integer greater than or equal to 1')
++  }
++  const discount = options.discount === undefined ? DEFAULT_DISCOUNT : options.discount
++  if (typeof discount !== 'number' || !(discount >= 0 && discount <= 1)) {
++    throw new RangeError('discount must be a number between 0 and 1')
++  }
++  const mode = options.mode === undefined ? 'word' : options.mode
++  if (!MODES.includes(mode)) {
++    throw new RangeError('mode must be one of ' + MODES.join(', '))
++  }
++  return { n, discount, mode }
++}
++
++function copyTokens (tokens) {
++  for (const token of tokens) {
++    if (typeof token !== 'string') {
++      throw new TypeError('tokens must be strings')
++    }
++  }
++  return tokens.slice()
++}
++
++class LanguageModel {
++  // options: { n, discount, mode }, see normaliseOptions for the defaults
++  constructor (options) {
++    const settings = normaliseOptions(options)
++    this.n = settings.n
++    this.discount = settings.discount
++    this.mode = settings.mode
++    this.sentences = []
++    this.trained = false
++    this.counts = null
++    this.continuation = []
++    this.vocab = new Set()
++  }
++
++  // Splits text into tokens: words for mode 'word', code points for mode 'character'
++  static tokenize (text, mode) {
++    if (typeof text !== 'string') {
++      throw new TypeError('text must be a string')
++    }
++    if (mode === undefined) {
++      mode = 'word'
++    }
++    if (mode === 'character') {
++      return Array.from(text)
++    }
++    if (mode === 'word') {
++      return wordTokenizer.tokenize(text)
++    }
++    throw new RangeError('mode must be one of ' + MODES.join(', '))
++  }
++
++  tokenize (text) {
++    return LanguageModel.tokenize(text, this.mode)
++  }
++
++  // Turns a sentence (string or array of tokens) into a token array the model owns
++  toTokens (sentence) {
++    if (typeof sentence === 'string') {
++      return this.tokenize(sentence)
++    }
++    if (Array.isArray(sentence)) {
++      return copyTokens(sentence)
++    }
++    throw new TypeError('sentence must be a string or an array of strings')
++  }
++
++  // Adds a sentence to the training data. Returns false if the sentence has no tokens.
++  // The model keeps its own copy of the tokens. Call train() to include the sentence in the counts.
++  addSentence (sentence) {
++    const tokens = this.toTokens(sentence)
++    if (tokens.length === 0) {
++      return false
++    }
++    this.sentences.push(tokens)
++    return true
++  }
++
++  // (Re)builds the counts from all sentences added so far
++  train () {
++    const counts = new CountTrie()
++    const vocab = new Set()
++    const starts = new Array(this.n - 1).fill(START_SYMBOL)
++    for (const sentence of this.sentences) {
++      const padded = starts.concat(sentence, [END_SYMBOL])
++      for (let i = this.n - 1; i < padded.length; i++) {
++        counts.add(padded.slice(i - this.n + 1, i + 1))
++      }
++      for (const token of sentence) {
++        vocab.add(token)
++      }
++      vocab.add(END_SYMBOL)
++    }
++
++    // Continuation counts: the number of distinct left extensions of each lower-order n-gram
++    const continuation = []
++    let higher = counts
++    for (let order = this.n - 1; order >= 1; order--) {
++      const trie = new CountTrie()
++      for (const sequence of higher.sequences()) {
++        trie.add(sequence.slice(1))
++      }
++      continuation[order] = trie
++      higher = trie
++    }
++
++    this.counts = counts
++    this.continuation = continuation
++    this.vocab = vocab
++    this.trained = true
++  }
++
++  // Probability of word given the preceding tokens. Only the last n - 1 tokens of the context are
++  // used. A shorter context is scored with the corresponding lower-order distribution; pass
++  // LanguageModel.START_SYMBOL tokens explicitly to score the beginning of a sentence.
++  probability (word, context) {
++    if (typeof word !== 'string') {
++      throw new TypeError('word must be a string')
++    }
++    if (context === undefined) {
++      context = []
++    }
++    if (!Array.isArray(context)) {
++      throw new TypeError('context must be an array of strings')
++    }
++    for (const token of context) {
++      if (typeof token !== 'string') {
++        throw new TypeError('context must be an array of strings')
++      }
++    }
++    if (!this.trained) {
++      return this.uniform()
++    }
++    const history = context.length > this.n - 1 ? context.slice(context.length - (this.n - 1)) : context
++    return this.interpolated(word, history)
++  }
++
++  uniform () {
++    return 1 / (this.vocab.size + 1)
++  }
++
++  interpolated (word, history) {
++    const order = history.length + 1
++    const table = order === this.n ? this.counts : this.continuation[order]
++    const lower = order === 1 ? this.uniform() : this.interpolated(word, history.slice(1))
++    const node = table.find(history)
++    if (node === undefined || node.total === 0) {
++      return lower
++    }
++    const child = node.children.get(word)
++    const count = child === undefined ? 0 : child.count
++    const discount = this.discount
++    return Math.max(count - discount, 0) / node.total +
++      (discount * node.children.size / node.total) * lower
++  }
++
++  // Natural logarithm of the probability of a sentence including its end symbol
++  logProbability (sentence) {
++    const tokens = this.toTokens(sentence)
++    const padded = new Array(this.n - 1).fill(START_SYMBOL).concat(tokens, [END_SYMBOL])
++    let logProbability = 0
++    for (let i = this.n - 1; i < padded.length; i++) {
++      logProbability += Math.log(this.probability(padded[i], padded.slice(i - this.n + 1, i)))
++    }
++    return logProbability
++  }
++
++  // Sorted list of the tokens seen during training (including the end symbol)
++  vocabulary () {
++    return Array.from(this.vocab).sort()
++  }
++
++  toJSON () {
++    return {
++      n: this.n,
++      discount: this.discount,
++      mode: this.mode,
++      trained: this.trained,
++      sentences: this.sentences.map(sentence => sentence.slice())
++    }
++  }
++
++  // Builds an independent model from the output of toJSON(). The model is retrained from its
++  // sentences if the original model had been trained.
++  static restore (json) {
++    if (json === null || typeof json !== 'object') {
++      throw new TypeError('json must be an object created by LanguageModel#toJSON')
++    }
++    if (!Array.isArray(json.sentences)) {
++      throw new TypeError('json.sentences must be an array of token arrays')
++    }
++    const model = new LanguageModel({ n: json.n, discount: json.discount, mode: json.mode })
++    for (const sentence of json.sentences) {
++      if (!Array.isArray(sentence)) {
++        throw new TypeError('json.sentences must be an array of token arrays')
++      }
++      model.addSentence(sentence)
++    }
++    if (json.trained) {
++      model.train()
++    }
++    return model
++  }
++}
++
++LanguageModel.START_SYMBOL = START_SYMBOL
++LanguageModel.END_SYMBOL = END_SYMBOL
++
++module.exports = LanguageModel
+diff --git a/lib/natural/spellcheck/index.d.ts b/lib/natural/spellcheck/index.d.ts
+index 20a2d48..e457bf4 100644
+--- a/lib/natural/spellcheck/index.d.ts
++++ b/lib/natural/spellcheck/index.d.ts
+@@ -23,10 +23,20 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ THE SOFTWARE.
+ */
+ 
++/** Anything that can score a word given the tokens preceding it, such as LanguageModel */
++export interface SpellcheckLanguageModel {
++  probability: (word: string, context: string[]) => number
++}
++
+ export declare class Spellcheck {
+-  constructor (wordlist: string[])
++  constructor (wordlist: string[], languageModel?: SpellcheckLanguageModel | null)
+   isCorrect (word: string): boolean
+-  getCorrections (word: string, maxDistance?: number): string[]
++  /**
++   * Suggested corrections, best first. With a language model and a context (the tokens
++   * preceding the word) candidates are ordered by decreasing probability under the model,
++   * then by increasing edit distance, decreasing wordlist frequency and code unit order.
++   */
++  getCorrections (word: string, maxDistance?: number, context?: string[] | null): string[]
+   edits (word: string): string[]
+   editsWithMaxDistance (word: string, maxDistance: number): string[]
+ }
+diff --git a/lib/natural/spellcheck/spellcheck.js b/lib/natural/spellcheck/spellcheck.js
+index 1593a11..c785ab3 100644
+--- a/lib/natural/spellcheck/spellcheck.js
++++ b/lib/natural/spellcheck/spellcheck.js
+@@ -27,17 +27,26 @@ const Trie = require('../trie/trie')
+ // Words that are an edit distance of n away from the mispelled word are considered infinitely more probable than words that are of an edit distance >n
+ 
+ // wordlist is a corpus (an array) from which word probabilities are calculated (so something like /usr/share/dict/words (on OSX) will work okay, but real world text will work better)
++// languageModel is optional. When given, getCorrections can rank candidates by the probability the model assigns to them given the preceding words (see getCorrections).
+ class Spellcheck {
+-  constructor (wordlist) {
++  constructor (wordlist, languageModel) {
+     this.trie = new Trie()
+     this.trie.addStrings(wordlist)
+-    this.word2frequency = {}
++    // A null-prototype table: words such as 'constructor' must not resolve to Object.prototype members
++    this.word2frequency = Object.create(null)
+     for (const i in wordlist) {
+       if (!this.word2frequency[wordlist[i]]) {
+         this.word2frequency[wordlist[i]] = 0
+       }
+       this.word2frequency[wordlist[i]]++
+     }
++    this.languageModel = null
++    if (languageModel !== undefined && languageModel !== null) {
++      if (typeof languageModel.probability !== 'function') {
++        throw new TypeError('languageModel must provide a probability(word, context) method')
++      }
++      this.languageModel = languageModel
++    }
+   }
+ 
+   isCorrect (word) {
+@@ -47,9 +56,18 @@ class Spellcheck {
+   // Returns a list of suggested corrections, from highest to lowest probability
+   // maxDistance is the maximum edit distance
+   // According to Norvig, literature suggests that 80% to 95% of spelling errors are an edit distance of 1 away from the correct word. This is good, because there are roughly 54n+25 strings 1 edit distance away from any given string of length n. So after maxDistance = 2, this becomes very slow.
+-  getCorrections (word, maxDistance) {
++  // context is an optional array of the tokens preceding the word. When the spellchecker was created with a language model and a context is given, the candidates are ordered by decreasing probability under the model given the context, then by increasing edit distance, then by decreasing frequency in the wordlist and finally by code unit order.
++  getCorrections (word, maxDistance, context) {
+     const self = this
+     if (!maxDistance) maxDistance = 1
++    if (context !== undefined && context !== null) {
++      if (!Array.isArray(context)) {
++        throw new TypeError('context must be an array of preceding tokens')
++      }
++      if (this.languageModel) {
++        return this.contextualCorrections(word, maxDistance, context)
++      }
++    }
+     let edits = this.editsWithMaxDistance(word, maxDistance)
+     edits = edits.slice(1, edits.length)
+     edits = edits.map(function (editList) {
+@@ -69,6 +87,39 @@ class Spellcheck {
+     })
+   }
+ 
++  // Ranks the wordlist entries within maxDistance of word using the language model.
++  // The word itself has edit distance 0 when it is in the wordlist.
++  contextualCorrections (word, maxDistance, context) {
++    const levels = this.editsWithMaxDistance(word, maxDistance)
++    const distances = new Map()
++    if (this.isCorrect(word)) {
++      distances.set(word, 0)
++    }
++    for (let distance = 1; distance < levels.length; distance++) {
++      for (const candidate of levels[distance]) {
++        if (!distances.has(candidate) && this.isCorrect(candidate)) {
++          distances.set(candidate, distance)
++        }
++      }
++    }
++    const candidates = []
++    for (const [candidate, distance] of distances) {
++      candidates.push({
++        candidate,
++        distance,
++        probability: this.languageModel.probability(candidate, context),
++        frequency: this.word2frequency[candidate] || 0
++      })
++    }
++    candidates.sort(function (a, b) {
++      return (b.probability - a.probability) ||
++        (a.distance - b.distance) ||
++        (b.frequency - a.frequency) ||
++        (a.candidate < b.candidate ? -1 : (a.candidate > b.candidate ? 1 : 0))
++    })
++    return candidates.map(function (entry) { return entry.candidate })
++  }
++
+   // Returns all edits that are 1 edit-distance away from the input word
+   edits (word) {
+     const alphabet = 'abcdefghijklmnopqrstuvwxyz'

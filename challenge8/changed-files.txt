@@ -1,0 +1,15 @@
+ lib/natural/classifiers/index.d.ts                 |  48 +-
+ lib/natural/classifiers/index.js                   |   1 +
+ .../classifiers/language_model_classifier.js       | 266 +++++++++
+ lib/natural/index.d.ts                             |   1 +
+ lib/natural/index.js                               |   1 +
+ lib/natural/language_model/index.d.ts              |  62 ++
+ lib/natural/language_model/index.js                |  25 +
+ lib/natural/language_model/language_model.js       | 324 ++++++++++
+ lib/natural/spellcheck/index.d.ts                  |  14 +-
+ lib/natural/spellcheck/spellcheck.js               |  57 +-
+ spec/language_model_classifier_spec.js             | 660 +++++++++++++++++++++
+ spec/language_model_spec.js                        | 359 +++++++++++
+ spec/language_model_types_spec.ts                  | 108 ++++
+ spec/spellcheck_context_spec.js                    | 196 ++++++
+ 14 files changed, 2111 insertions(+), 11 deletions(-)
