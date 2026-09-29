@@ -40,12 +40,12 @@ const Classifier = require('../lib/natural/classifiers/classifier')
 const LanguageModelClassifier = natural.LanguageModelClassifier
 const LanguageModel = natural.LanguageModel
 const LancasterStemmer = natural.LancasterStemmer
-const PorterStemmer = natural.PorterStemmer
 
 const STORAGE_TIMEOUT = 10000
+const DEFAULT_OPTIONS = { n: 3, discount: 0.75, unit: 'word', minCount: 1 }
 
-function setupClassifier (stemmer, options) {
-  const classifier = new LanguageModelClassifier(stemmer, options)
+function setupClassifier (options) {
+  const classifier = new LanguageModelClassifier(options)
   classifier.addDocument('i fixed the box', 'computing')
   classifier.addDocument('i write code', 'computing')
   classifier.addDocument('nasty script code', 'computing')
@@ -70,8 +70,8 @@ describe('LanguageModelClassifier', function () {
     return Promise.resolve(classifier)
   }
 
-  function restoredCopy (classifier, stemmer) {
-    return Promise.resolve(LanguageModelClassifier.restore(JSON.parse(JSON.stringify(classifier)), stemmer))
+  function restoredCopy (classifier) {
+    return Promise.resolve(LanguageModelClassifier.restore(JSON.parse(JSON.stringify(classifier))))
   }
 
   function fileCopy (classifier, stemmer) {
@@ -114,41 +114,43 @@ describe('LanguageModelClassifier', function () {
   })
 
   describe('options', function () {
-    it('uses a trigram word model with discount 0.75 by default', function () {
+    it('uses a trigram word model with discount 0.75 and minCount 1 by default', function () {
       const classifier = new LanguageModelClassifier()
-      expect(classifier.options).toEqual({ n: 3, discount: 0.75, mode: 'word' })
+      expect(classifier.options).toEqual(DEFAULT_OPTIONS)
       expect(classifier.models.size).toBe(0)
       expect(classifier.docs).toEqual([])
       expect(classifier.lastAdded).toBe(0)
     })
 
     it('accepts options in the constructor and through setOptions', function () {
-      const classifier = new LanguageModelClassifier(null, { n: 2, mode: 'character' })
-      expect(classifier.options).toEqual({ n: 2, discount: 0.75, mode: 'character' })
+      const classifier = new LanguageModelClassifier({ n: 2, unit: 'char' })
+      expect(classifier.options).toEqual({ n: 2, discount: 0.75, unit: 'char', minCount: 1 })
       classifier.setOptions({ discount: 0.5, keepStops: true })
-      expect(classifier.options).toEqual({ n: 2, discount: 0.5, mode: 'character' })
+      expect(classifier.options).toEqual({ n: 2, discount: 0.5, unit: 'char', minCount: 1 })
       expect(classifier.keepStops).toBe(true)
-      classifier.setOptions({ mode: 'word', n: 1 })
-      expect(classifier.options).toEqual({ n: 1, discount: 0.5, mode: 'word' })
+      classifier.setOptions({ unit: 'word', n: 1, minCount: 3 })
+      expect(classifier.options).toEqual({ n: 1, discount: 0.5, unit: 'word', minCount: 3 })
     })
 
     it('rejects invalid options', function () {
-      expect(() => new LanguageModelClassifier(null, { n: 0 })).toThrowError(RangeError)
-      expect(() => new LanguageModelClassifier(null, { discount: 2 })).toThrowError(RangeError)
-      expect(() => new LanguageModelClassifier(null, { mode: 'syllable' })).toThrowError(RangeError)
+      expect(() => new LanguageModelClassifier({ n: 0 })).toThrowError(RangeError)
+      expect(() => new LanguageModelClassifier({ discount: 2 })).toThrowError(RangeError)
+      expect(() => new LanguageModelClassifier({ unit: 'syllable' })).toThrowError(RangeError)
+      expect(() => new LanguageModelClassifier({ minCount: 0 })).toThrowError(RangeError)
       const classifier = new LanguageModelClassifier()
       expect(() => classifier.setOptions({ n: -1 })).toThrowError(RangeError)
       expect(() => classifier.setOptions(null)).toThrowError(TypeError)
-      expect(classifier.options).toEqual({ n: 3, discount: 0.75, mode: 'word' })
+      expect(classifier.options).toEqual(DEFAULT_OPTIONS)
     })
 
-    it('does not allow the mode to change once documents have been added', function () {
+    it('does not allow the unit to change once documents have been added', function () {
       const classifier = new LanguageModelClassifier()
       classifier.addDocument('some text', 'label')
-      expect(() => classifier.setOptions({ mode: 'character' })).toThrowError(Error)
-      expect(classifier.options.mode).toBe('word')
-      classifier.setOptions({ n: 2 })
+      expect(() => classifier.setOptions({ unit: 'char' })).toThrowError(Error)
+      expect(classifier.options.unit).toBe('word')
+      classifier.setOptions({ n: 2, minCount: 2 })
       expect(classifier.options.n).toBe(2)
+      expect(classifier.options.minCount).toBe(2)
     })
 
     it('does not allow model options to change after training', function () {
@@ -156,7 +158,8 @@ describe('LanguageModelClassifier', function () {
       classifier.train()
       expect(() => classifier.setOptions({ n: 2 })).toThrowError(Error)
       expect(() => classifier.setOptions({ discount: 0.1 })).toThrowError(Error)
-      expect(classifier.options).toEqual({ n: 3, discount: 0.75, mode: 'word' })
+      expect(() => classifier.setOptions({ minCount: 2 })).toThrowError(Error)
+      expect(classifier.options).toEqual(DEFAULT_OPTIONS)
       classifier.setOptions({ keepStops: true })
       expect(classifier.keepStops).toBe(true)
     })
@@ -177,8 +180,8 @@ describe('LanguageModelClassifier', function () {
       expect(classifier.docs).toEqual([{ label: 'sports', text: ['The', 'Runners', 'were', 'running'] }])
     })
 
-    it('splits strings into characters in character mode', function () {
-      const classifier = new LanguageModelClassifier(null, { mode: 'character' })
+    it('splits strings into characters for the char unit', function () {
+      const classifier = new LanguageModelClassifier({ unit: 'char' })
       classifier.addDocument('ab c', 'label')
       expect(classifier.docs).toEqual([{ label: 'label', text: ['a', 'b', ' ', 'c'] }])
     })
@@ -209,9 +212,8 @@ describe('LanguageModelClassifier', function () {
   })
 
   describe('ignores the stemmer', function () {
-    it('accepts a stemmer for compatibility but uses the tokens as they are', function () {
-      const classifier = new LanguageModelClassifier(LancasterStemmer)
-      expect(classifier.stemmer).toBe(LancasterStemmer)
+    it('uses the tokens as they are', function () {
+      const classifier = new LanguageModelClassifier()
       classifier.addDocument('Running quickly', 'motion')
       classifier.addDocument('Sleeping soundly', 'rest')
       expect(classifier.docs).toEqual([
@@ -221,17 +223,16 @@ describe('LanguageModelClassifier', function () {
       classifier.train()
       expect(classifier.classify('Running')).toBe('motion')
       expect(classifier.classify(['Sleeping'])).toBe('rest')
-      expect(new LanguageModelClassifier().stemmer).toBe(PorterStemmer)
+      expect(classifier.getClassifications('running')).toEqual(classifier.getClassifications('Walking'))
     })
 
     Object.keys(copies).forEach(function (name) {
-      it('still ignores the stemmer after being copied ' + name, async function () {
-        const classifier = new LanguageModelClassifier(LancasterStemmer)
+      it('when a stemmer is passed while being copied ' + name, async function () {
+        const classifier = new LanguageModelClassifier()
         classifier.addDocument('Running quickly', 'motion')
         classifier.addDocument('Sleeping soundly', 'rest')
         classifier.train()
         const copy = await copies[name](classifier, LancasterStemmer)
-        expect(copy.stemmer).toBe(LancasterStemmer)
         expect(copy.docs).toEqual(classifier.docs)
         expect(copy.classify('Running')).toBe('motion')
         copy.addDocument('Walking slowly', 'motion')
@@ -256,7 +257,7 @@ describe('LanguageModelClassifier', function () {
     })
 
     it('builds one trained language model per label with the classifier options', function () {
-      const classifier = setupClassifier(null, { n: 2, discount: 0.5 })
+      const classifier = setupClassifier({ n: 2, discount: 0.5, minCount: 2 })
       classifier.train()
       expect(Array.from(classifier.models.keys())).toEqual(['computing', 'literature'])
       classifier.models.forEach(function (model) {
@@ -264,8 +265,11 @@ describe('LanguageModelClassifier', function () {
         expect(model.trained).toBe(true)
         expect(model.n).toBe(2)
         expect(model.discount).toBe(0.5)
+        expect(model.unit).toBe('word')
+        expect(model.minCount).toBe(2)
         expect(model.sentences.length).toBe(3)
       })
+      expect(classifier.models.get('computing').vocabulary()).toEqual(['</s>', 'code', 'i'])
       expect(classifier.models.get('computing').sentences[1]).toEqual(['i', 'write', 'code'])
     })
 
@@ -307,7 +311,7 @@ describe('LanguageModelClassifier', function () {
     it('computes the posterior from the label prior and the language model', function () {
       // Character unigram models with discount 0.5: for label A ('aa') P(a) = 11/18 and for
       // label B ('bb') P(a) = 2/18; the end symbol probabilities are equal, so P(A | 'a') = 11/13.
-      const classifier = new LanguageModelClassifier(null, { mode: 'character', n: 1, discount: 0.5 })
+      const classifier = new LanguageModelClassifier({ unit: 'char', n: 1, discount: 0.5 })
       classifier.addDocument('aa', 'A')
       classifier.addDocument('bb', 'B')
       classifier.train()
@@ -322,7 +326,7 @@ describe('LanguageModelClassifier', function () {
     it('takes the label prior into account', function () {
       // With discount 0 both unigram models assign the same probabilities, so only the
       // number of documents per label differs
-      const classifier = new LanguageModelClassifier(null, { n: 1, discount: 0 })
+      const classifier = new LanguageModelClassifier({ n: 1, discount: 0 })
       classifier.addDocument(['x'], 'frequent')
       classifier.addDocument(['x'], 'frequent')
       classifier.addDocument(['x'], 'frequent')
@@ -430,11 +434,11 @@ describe('LanguageModelClassifier', function () {
 
   describe('toJSON and restore', function () {
     it('serialises options, documents, features and models', function () {
-      const classifier = setupClassifier(null, { n: 2 })
+      const classifier = setupClassifier({ n: 2, minCount: 2 })
       classifier.setOptions({ keepStops: true })
       classifier.train()
       const json = classifier.toJSON()
-      expect(json.options).toEqual({ n: 2, discount: 0.75, mode: 'word' })
+      expect(json.options).toEqual({ n: 2, discount: 0.75, unit: 'word', minCount: 2 })
       expect(json.keepStops).toBe(true)
       expect(json.docs).toEqual(classifier.docs)
       expect(json.features).toEqual(Object.assign({}, classifier.features))
@@ -595,10 +599,10 @@ describe('LanguageModelClassifier', function () {
   describe('options survive copies', function () {
     Object.keys(copies).forEach(function (name) {
       it('when ' + name, async function () {
-        const characters = new LanguageModelClassifier(null, { mode: 'character', n: 1, discount: 0.5 })
+        const characters = new LanguageModelClassifier({ unit: 'char', n: 1, discount: 0.5 })
         characters.setOptions({ keepStops: true })
         const charactersCopy = await copies[name](characters)
-        expect(charactersCopy.options).toEqual({ n: 1, discount: 0.5, mode: 'character' })
+        expect(charactersCopy.options).toEqual({ n: 1, discount: 0.5, unit: 'char', minCount: 1 })
         expect(charactersCopy.keepStops).toBe(true)
         expect(charactersCopy.models.size).toBe(0)
         charactersCopy.addDocument('aa', 'A')
@@ -608,17 +612,19 @@ describe('LanguageModelClassifier', function () {
         expect(classifications.map(function (c) { return c.label })).toEqual(['A', 'B'])
         expect(classifications[0].value).toBeCloseTo(11 / 13, 12)
         expect(classifications[1].value).toBeCloseTo(2 / 13, 12)
-        expect(charactersCopy.models.get('A').mode).toBe('character')
+        expect(charactersCopy.models.get('A').unit).toBe('char')
 
-        const words = new LanguageModelClassifier(undefined, { n: 2 })
+        const words = new LanguageModelClassifier({ n: 2, minCount: 2 })
         const wordsCopy = await copies[name](words)
-        expect(wordsCopy.options).toEqual({ n: 2, discount: 0.75, mode: 'word' })
-        wordsCopy.addDocument('read the book', 'literature')
-        wordsCopy.addDocument('write the code', 'computing')
+        expect(wordsCopy.options).toEqual({ n: 2, discount: 0.75, unit: 'word', minCount: 2 })
+        wordsCopy.addDocument('read the book the book', 'literature')
+        wordsCopy.addDocument('write the code the code', 'computing')
         wordsCopy.train()
         expect(wordsCopy.classify('the book')).toBe('literature')
         expect(wordsCopy.models.get('literature').n).toBe(2)
-        expect(wordsCopy.models.get('literature').sentences).toEqual([['read', 'the', 'book']])
+        expect(wordsCopy.models.get('literature').minCount).toBe(2)
+        expect(wordsCopy.models.get('literature').vocabulary()).toEqual(['</s>', 'book', 'the'])
+        expect(wordsCopy.models.get('literature').sentences).toEqual([['read', 'the', 'book', 'the', 'book']])
       }, STORAGE_TIMEOUT)
     })
   })
@@ -644,7 +650,6 @@ describe('LanguageModelClassifier', function () {
       const loaded = await LanguageModelClassifier.loadFrom(key, LancasterStemmer, backend)
       expect(loaded).toEqual(jasmine.any(LanguageModelClassifier))
       expect(loaded).not.toBe(classifier)
-      expect(loaded.stemmer).toBe(LancasterStemmer)
       expect(loaded.options).toEqual(classifier.options)
       expect(loaded.docs).toEqual(classifier.docs)
       expect(loaded.lastAdded).toBe(6)

@@ -2,7 +2,7 @@ import events from 'events'
 import type { Corpus, Sentence } from '../brill_pos_tagger'
 import type { Stemmer } from '../stemmers'
 import type { StorageBackend } from '../util'
-import type { LanguageModel, LanguageModelJSON, LanguageModelMode, LanguageModelOptions } from '../language_model'
+import type { LanguageModel, LanguageModelJSON, LanguageModelOptions, LanguageModelUnit } from '../language_model'
 
 // Start apparatus declarations
 
@@ -132,7 +132,7 @@ declare interface LanguageModelClassifierDoc {
 }
 
 declare interface LanguageModelClassifierJSON {
-  options: { n: number, discount: number, mode: LanguageModelMode }
+  options: { n: number, discount: number, unit: LanguageModelUnit, minCount: number }
   keepStops: boolean
   docs: LanguageModelClassifierDoc[]
   features: Record<string, number>
@@ -143,18 +143,18 @@ declare interface LanguageModelClassifierJSON {
 declare type LanguageModelClassifierCallback = (err: NodeJS.ErrnoException | null, classifier?: LanguageModelClassifier) => void
 
 /**
- * Classifier with one Kneser-Ney language model per label. Text is not stemmed: the stemmer
- * argument only exists for compatibility with the other classifiers.
+ * Classifier with one Kneser-Ney language model per label. Text is never stemmed: the stemmer
+ * parameter of load and loadFrom only exists for compatibility with the other classifiers.
  */
 export class LanguageModelClassifier extends ClassifierBase {
-  readonly options: { readonly n: number, readonly discount: number, readonly mode: LanguageModelMode }
+  readonly options: { readonly n: number, readonly discount: number, readonly unit: LanguageModelUnit, readonly minCount: number }
   models: Map<string, LanguageModel>
 
-  constructor (stemmer?: Stemmer | null, options?: LanguageModelClassifierOptions)
+  constructor (options?: LanguageModelClassifierOptions)
   setOptions (options: LanguageModelClassifierOptions): void
   tokenize (text: string): string[]
   toJSON (): LanguageModelClassifierJSON
-  static restore (classifier: LanguageModelClassifierJSON, stemmer?: Stemmer | null): LanguageModelClassifier
+  static restore (classifier: LanguageModelClassifierJSON): LanguageModelClassifier
   static load (filename: string, stemmer: Stemmer | null | undefined, callback: LanguageModelClassifierCallback): void
   saveTo (storage: StorageBackend): Promise<string>
   static loadFrom (key: string, stemmer: Stemmer | null | undefined, storage: StorageBackend): Promise<LanguageModelClassifier>

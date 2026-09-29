@@ -25,12 +25,12 @@ THE SOFTWARE.
 const Classifier = require('./classifier')
 const LanguageModel = require('../language_model/language_model')
 
-const MODEL_OPTION_KEYS = ['n', 'discount', 'mode']
+const MODEL_OPTION_KEYS = ['n', 'discount', 'unit', 'minCount']
 
 // Validates language model options and returns the normalised values
 function readModelOptions (options) {
   const model = new LanguageModel(options)
-  return { n: model.n, discount: model.discount, mode: model.mode }
+  return { n: model.n, discount: model.discount, unit: model.unit, minCount: model.minCount }
 }
 
 function sameTokens (a, b) {
@@ -56,19 +56,19 @@ function compareLabels (a, b) {
 
 // Classifier that trains one Kneser-Ney language model per label and classifies text by the
 // posterior probability of each label (the label's prior times the probability of the text
-// under the label's model). Unlike the other classifiers, text is not stemmed: the stemmer
-// argument is accepted for API compatibility only and tokens are used as they are.
+// under the label's model). Unlike the other classifiers, text is never stemmed: tokens are used
+// as they are, and the stemmer parameter of load and loadFrom is accepted for compatibility only.
 class LanguageModelClassifier extends Classifier {
-  // options: { n, discount, mode } (see LanguageModel) plus the base keepStops option
-  constructor (stemmer, options) {
-    super(null, stemmer)
+  // options: { n, discount, unit, minCount } (see LanguageModel) plus the base keepStops option
+  constructor (options) {
+    super(null)
     this.features = Object.create(null)
     this.options = readModelOptions(options)
     this.models = new Map()
   }
 
-  // n, discount and mode can be set until the classifier is trained; mode can only be set while
-  // no documents have been added, because documents are tokenised when they are added.
+  // n, discount, unit and minCount can be set until the classifier is trained; unit can only be
+  // set while no documents have been added, because documents are tokenised when they are added.
   setOptions (options) {
     if (options === null || typeof options !== 'object') {
       throw new TypeError('options must be an object')
@@ -86,17 +86,17 @@ class LanguageModelClassifier extends Classifier {
       return
     }
     if (this.models.size > 0) {
-      throw new Error('n, discount and mode cannot be changed after training; create a new classifier instead')
+      throw new Error('n, discount, unit and minCount cannot be changed after training; create a new classifier instead')
     }
     const next = readModelOptions(Object.assign({}, this.options, requested))
-    if (next.mode !== this.options.mode && this.docs.length > 0) {
-      throw new Error('mode cannot be changed once documents have been added')
+    if (next.unit !== this.options.unit && this.docs.length > 0) {
+      throw new Error('unit cannot be changed once documents have been added')
     }
     this.options = next
   }
 
   tokenize (text) {
-    return LanguageModel.tokenize(text, this.options.mode)
+    return LanguageModel.tokenize(text, this.options.unit)
   }
 
   toTokens (text) {
@@ -234,12 +234,12 @@ class LanguageModelClassifier extends Classifier {
   }
 
   // Builds an independent classifier from the output of toJSON()
-  static restore (classifier, stemmer) {
+  static restore (classifier) {
     if (classifier === null || typeof classifier !== 'object' ||
         !Array.isArray(classifier.docs) || !Array.isArray(classifier.models)) {
       throw new TypeError('classifier must be an object created by LanguageModelClassifier#toJSON')
     }
-    const restored = new LanguageModelClassifier(stemmer, classifier.options)
+    const restored = new LanguageModelClassifier(classifier.options)
     restored.keepStops = !!classifier.keepStops
     restored.docs = classifier.docs.map(doc => ({ label: doc.label, text: restored.toTokens(doc.text) }))
     restored.features = Object.assign(Object.create(null), classifier.features)
@@ -248,18 +248,20 @@ class LanguageModelClassifier extends Classifier {
     return restored
   }
 
+  // The stemmer has the same position as in the other classifiers and is ignored
   static load (filename, stemmer, callback) {
     Classifier.load(filename, stemmer, function (err, classifier) {
       if (err) {
         return callback(err)
       }
-      callback(err, LanguageModelClassifier.restore(classifier, stemmer))
+      callback(err, LanguageModelClassifier.restore(classifier))
     })
   }
 
+  // The stemmer has the same position as in the other classifiers and is ignored
   static async loadFrom (key, stemmer, storageBackend) {
     const classifier = await Classifier.loadFrom(key, storageBackend)
-    return LanguageModelClassifier.restore(classifier, stemmer)
+    return LanguageModelClassifier.restore(classifier)
   }
 }
 

@@ -50,7 +50,7 @@ function memoryBackend (): StorageBackend {
 
 describe('LanguageModel declarations', function () {
   it('declare the language model API', function () {
-    const model: LanguageModel = new LanguageModel({ n: 2, discount: 0.5, mode: 'word' })
+    const model: LanguageModel = new LanguageModel({ n: 2, discount: 0.5, unit: 'word', minCount: 1 })
     const added: boolean = model.addSentence('drink tea')
     model.addSentence(['count', 'ten'])
     model.train()
@@ -60,8 +60,9 @@ describe('LanguageModel declarations', function () {
     const json: LanguageModelJSON = model.toJSON()
     const copy: LanguageModel = LanguageModel.restore(json)
     const vocabulary: string[] = copy.vocabulary()
-    const tokens: string[] = LanguageModel.tokenize('drink tea', 'character')
+    const tokens: string[] = LanguageModel.tokenize('drink tea', 'char')
     const start: string = LanguageModel.START_SYMBOL
+    const unknown: string = LanguageModel.UNKNOWN_SYMBOL
 
     expect(added).toBe(true)
     expect(probability).toBeGreaterThan(unigram)
@@ -69,12 +70,15 @@ describe('LanguageModel declarations', function () {
     expect(vocabulary).toContain('tea')
     expect(tokens.length).toBe(9)
     expect(start).toBe('<s>')
+    expect(unknown).toBe('<unk>')
     expect(copy.n).toBe(2)
+    expect(copy.minCount).toBe(1)
+    expect(copy.unit).toBe('word')
     expect(copy.trained).toBe(true)
   })
 
   it('declare the classifier API including its storage methods', async function () {
-    const classifier = new LanguageModelClassifier(LancasterStemmer, { n: 2, mode: 'word' })
+    const classifier = new LanguageModelClassifier({ n: 2, unit: 'word', minCount: 1 })
     classifier.setOptions({ discount: 0.5, keepStops: true })
     classifier.addDocument('write the code', 'computing')
     classifier.addDocument(['read', 'the', 'book'], 'literature')
@@ -85,14 +89,16 @@ describe('LanguageModel declarations', function () {
     const backend = memoryBackend()
     const key: string = await classifier.saveTo(backend)
     const loaded: LanguageModelClassifier = await LanguageModelClassifier.loadFrom(key, LancasterStemmer, backend)
-    const restored: LanguageModelClassifier = LanguageModelClassifier.restore(classifier.toJSON(), null)
+    const restored: LanguageModelClassifier = LanguageModelClassifier.restore(classifier.toJSON())
 
     expect(label).toBe('computing')
     expect(classifications[0].label).toBe('literature')
     expect(models.size).toBe(2)
     expect(loaded.classify('the book')).toBe('literature')
     expect(loaded.options.discount).toBe(0.5)
+    expect(loaded.options.unit).toBe('word')
     expect(restored.options.n).toBe(2)
+    expect(restored.options.minCount).toBe(1)
   })
 
   it('declare the contextual spellcheck API', function () {

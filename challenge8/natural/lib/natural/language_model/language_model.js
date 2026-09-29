@@ -26,17 +26,21 @@ const WordTokenizer = require('../tokenizers/regexp_tokenizer').WordTokenizer
 
 // Interpolated Kneser-Ney n-gram language model.
 //
+// Tokens seen fewer than minCount times in the training data are replaced by the unknown symbol.
 // Sentences are padded with n - 1 start symbols and one end symbol. Every n-gram of the padded
 // sentences is counted. The lower-order distributions use continuation counts (the number of
 // distinct left extensions of an n-gram), derived from the counts of the next higher order.
 // The unigram distribution is interpolated with a uniform distribution over the vocabulary plus
-// one slot for unknown words, so every word has a non-zero probability once the model is trained.
+// the unknown symbol, so every word has a non-zero probability once the model is trained. Words
+// that are not in the vocabulary are scored as the unknown symbol.
 
 const START_SYMBOL = '<s>'
 const END_SYMBOL = '</s>'
-const MODES = ['word', 'character']
+const UNKNOWN_SYMBOL = '<unk>'
+const UNITS = ['word', 'char']
 const DEFAULT_N = 3
 const DEFAULT_DISCOUNT = 0.75
+const DEFAULT_MIN_COUNT = 1
 
 const wordTokenizer = new WordTokenizer()
 
@@ -118,11 +122,15 @@ function normaliseOptions (options) {
   if (typeof discount !== 'number' || !(discount >= 0 && discount <= 1)) {
     throw new RangeError('discount must be a number between 0 and 1')
   }
-  const mode = options.mode === undefined ? 'word' : options.mode
-  if (!MODES.includes(mode)) {
-    throw new RangeError('mode must be one of ' + MODES.join(', '))
+  const unit = options.unit === undefined ? 'word' : options.unit
+  if (!UNITS.includes(unit)) {
+    throw new RangeError('unit must be one of ' + UNITS.join(', '))
   }
-  return { n, discount, mode }
+  const minCount = options.minCount === undefined ? DEFAULT_MIN_COUNT : options.minCount
+  if (!Number.isInteger(minCount) || minCount < 1) {
+    throw new RangeError('minCount must be an integer greater than or equal to 1')
+  }
+  return { n, discount, unit, minCount }
 }
 
 function copyTokens (tokens) {
@@ -135,12 +143,13 @@ function copyTokens (tokens) {
 }
 
 class LanguageModel {
-  // options: { n, discount, mode }, see normaliseOptions for the defaults
+  // options: { n, discount, unit, minCount }, see normaliseOptions for the defaults
   constructor (options) {
     const settings = normaliseOptions(options)
     this.n = settings.n
     this.discount = settings.discount
-    this.mode = settings.mode
+    this.unit = settings.unit
+    this.minCount = settings.minCount
     this.sentences = []
     this.trained = false
     this.counts = null
@@ -148,25 +157,25 @@ class LanguageModel {
     this.vocab = new Set()
   }
 
-  // Splits text into tokens: words for mode 'word', code points for mode 'character'
-  static tokenize (text, mode) {
+  // Splits text into tokens: words for unit 'word', code points for unit 'char'
+  static tokenize (text, unit) {
     if (typeof text !== 'string') {
       throw new TypeError('text must be a string')
     }
-    if (mode === undefined) {
-      mode = 'word'
+    if (unit === undefined) {
+      unit = 'word'
     }
-    if (mode === 'character') {
+    if (unit === 'char') {
       return Array.from(text)
     }
-    if (mode === 'word') {
+    if (unit === 'word') {
       return wordTokenizer.tokenize(text)
     }
-    throw new RangeError('mode must be one of ' + MODES.join(', '))
+    throw new RangeError('unit must be one of ' + UNITS.join(', '))
   }
 
   tokenize (text) {
-    return LanguageModel.tokenize(text, this.mode)
+    return LanguageModel.tokenize(text, this.unit)
   }
 
   // Turns a sentence (string or array of tokens) into a token array the model owns
@@ -193,18 +202,31 @@ class LanguageModel {
 
   // (Re)builds the counts from all sentences added so far
   train () {
-    const counts = new CountTrie()
+    // The vocabulary: tokens seen at least minCount times, plus the end symbol
+    const frequencies = new Map()
+    for (const sentence of this.sentences) {
+      for (const token of sentence) {
+        frequencies.set(token, (frequencies.get(token) || 0) + 1)
+      }
+    }
     const vocab = new Set()
+    for (const [token, frequency] of frequencies) {
+      if (frequency >= this.minCount) {
+        vocab.add(token)
+      }
+    }
+    if (this.sentences.length > 0) {
+      vocab.add(END_SYMBOL)
+    }
+    const known = token => (vocab.has(token) ? token : UNKNOWN_SYMBOL)
+
+    const counts = new CountTrie()
     const starts = new Array(this.n - 1).fill(START_SYMBOL)
     for (const sentence of this.sentences) {
-      const padded = starts.concat(sentence, [END_SYMBOL])
+      const padded = starts.concat(sentence.map(known), [END_SYMBOL])
       for (let i = this.n - 1; i < padded.length; i++) {
         counts.add(padded.slice(i - this.n + 1, i + 1))
       }
-      for (const token of sentence) {
-        vocab.add(token)
-      }
-      vocab.add(END_SYMBOL)
     }
 
     // Continuation counts: the number of distinct left extensions of each lower-order n-gram
@@ -225,9 +247,18 @@ class LanguageModel {
     this.trained = true
   }
 
+  // Maps a token that is not in the vocabulary to the unknown symbol; padding symbols pass through
+  normaliseToken (token) {
+    if (token === START_SYMBOL || token === END_SYMBOL || this.vocab.has(token)) {
+      return token
+    }
+    return UNKNOWN_SYMBOL
+  }
+
   // Probability of word given the preceding tokens. Only the last n - 1 tokens of the context are
   // used. A shorter context is scored with the corresponding lower-order distribution; pass
-  // LanguageModel.START_SYMBOL tokens explicitly to score the beginning of a sentence.
+  // LanguageModel.START_SYMBOL tokens explicitly to score the beginning of a sentence. Words and
+  // context tokens outside the vocabulary are scored as the unknown symbol.
   probability (word, context) {
     if (typeof word !== 'string') {
       throw new TypeError('word must be a string')
@@ -247,7 +278,7 @@ class LanguageModel {
       return this.uniform()
     }
     const history = context.length > this.n - 1 ? context.slice(context.length - (this.n - 1)) : context
-    return this.interpolated(word, history)
+    return this.interpolated(this.normaliseToken(word), history.map(token => this.normaliseToken(token)))
   }
 
   uniform () {
@@ -280,7 +311,7 @@ class LanguageModel {
     return logProbability
   }
 
-  // Sorted list of the tokens seen during training (including the end symbol)
+  // Sorted list of the tokens kept during training (including the end symbol)
   vocabulary () {
     return Array.from(this.vocab).sort()
   }
@@ -289,7 +320,8 @@ class LanguageModel {
     return {
       n: this.n,
       discount: this.discount,
-      mode: this.mode,
+      unit: this.unit,
+      minCount: this.minCount,
       trained: this.trained,
       sentences: this.sentences.map(sentence => sentence.slice())
     }
@@ -304,7 +336,7 @@ class LanguageModel {
     if (!Array.isArray(json.sentences)) {
       throw new TypeError('json.sentences must be an array of token arrays')
     }
-    const model = new LanguageModel({ n: json.n, discount: json.discount, mode: json.mode })
+    const model = new LanguageModel({ n: json.n, discount: json.discount, unit: json.unit, minCount: json.minCount })
     for (const sentence of json.sentences) {
       if (!Array.isArray(sentence)) {
         throw new TypeError('json.sentences must be an array of token arrays')
@@ -320,5 +352,6 @@ class LanguageModel {
 
 LanguageModel.START_SYMBOL = START_SYMBOL
 LanguageModel.END_SYMBOL = END_SYMBOL
+LanguageModel.UNKNOWN_SYMBOL = UNKNOWN_SYMBOL
 
 module.exports = LanguageModel

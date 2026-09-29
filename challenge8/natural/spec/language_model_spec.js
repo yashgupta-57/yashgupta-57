@@ -27,6 +27,7 @@ const LanguageModel = natural.LanguageModel
 
 const START = LanguageModel.START_SYMBOL
 const END = LanguageModel.END_SYMBOL
+const UNK = LanguageModel.UNKNOWN_SYMBOL
 
 // Sums the probability of every known word plus one unknown word: an interpolated model must
 // distribute exactly one unit of probability mass over the vocabulary and the unknown slot.
@@ -45,20 +46,22 @@ describe('LanguageModel', function () {
   })
 
   describe('constructor', function () {
-    it('uses a trigram model with discount 0.75 in word mode by default', function () {
+    it('uses a trigram word model with discount 0.75 and minCount 1 by default', function () {
       const model = new LanguageModel()
       expect(model.n).toBe(3)
       expect(model.discount).toBe(0.75)
-      expect(model.mode).toBe('word')
+      expect(model.unit).toBe('word')
+      expect(model.minCount).toBe(1)
       expect(model.trained).toBe(false)
       expect(model.sentences).toEqual([])
     })
 
-    it('accepts n, discount and mode options', function () {
-      const model = new LanguageModel({ n: 2, discount: 0.5, mode: 'character' })
+    it('accepts n, discount, unit and minCount options', function () {
+      const model = new LanguageModel({ n: 2, discount: 0.5, unit: 'char', minCount: 2 })
       expect(model.n).toBe(2)
       expect(model.discount).toBe(0.5)
-      expect(model.mode).toBe('character')
+      expect(model.unit).toBe('char')
+      expect(model.minCount).toBe(2)
     })
 
     it('rejects invalid options', function () {
@@ -68,40 +71,45 @@ describe('LanguageModel', function () {
       expect(() => new LanguageModel({ discount: -0.1 })).toThrowError(RangeError)
       expect(() => new LanguageModel({ discount: 1.1 })).toThrowError(RangeError)
       expect(() => new LanguageModel({ discount: NaN })).toThrowError(RangeError)
-      expect(() => new LanguageModel({ mode: 'syllable' })).toThrowError(RangeError)
+      expect(() => new LanguageModel({ unit: 'character' })).toThrowError(RangeError)
+      expect(() => new LanguageModel({ unit: 'syllable' })).toThrowError(RangeError)
+      expect(() => new LanguageModel({ minCount: 0 })).toThrowError(RangeError)
+      expect(() => new LanguageModel({ minCount: 1.5 })).toThrowError(RangeError)
       expect(() => new LanguageModel('word')).toThrowError(TypeError)
     })
 
-    it('exposes the padding symbols', function () {
+    it('exposes the padding and unknown symbols', function () {
       expect(START).toBe('<s>')
       expect(END).toBe('</s>')
+      expect(UNK).toBe('<unk>')
     })
   })
 
   describe('tokenize', function () {
-    it('splits words in word mode', function () {
+    it('splits words for the word unit', function () {
       expect(LanguageModel.tokenize('The cat, the dog!')).toEqual(['The', 'cat', 'the', 'dog'])
+      expect(LanguageModel.tokenize('The cat', 'word')).toEqual(['The', 'cat'])
       expect(new LanguageModel().tokenize('a b')).toEqual(['a', 'b'])
     })
 
-    it('splits code points in character mode', function () {
-      expect(LanguageModel.tokenize('ab c', 'character')).toEqual(['a', 'b', ' ', 'c'])
-      expect(new LanguageModel({ mode: 'character' }).tokenize('😀!')).toEqual(['😀', '!'])
+    it('splits code points for the char unit', function () {
+      expect(LanguageModel.tokenize('ab c', 'char')).toEqual(['a', 'b', ' ', 'c'])
+      expect(new LanguageModel({ unit: 'char' }).tokenize('😀!')).toEqual(['😀', '!'])
     })
 
-    it('rejects non-strings and unknown modes', function () {
+    it('rejects non-strings and unknown units', function () {
       expect(() => LanguageModel.tokenize(42)).toThrowError(TypeError)
       expect(() => LanguageModel.tokenize('a', 'syllable')).toThrowError(RangeError)
     })
   })
 
   describe('addSentence', function () {
-    it('tokenises strings according to the mode', function () {
+    it('tokenises strings according to the unit', function () {
       const words = new LanguageModel()
       expect(words.addSentence('I love cats')).toBe(true)
       expect(words.sentences).toEqual([['I', 'love', 'cats']])
 
-      const characters = new LanguageModel({ mode: 'character' })
+      const characters = new LanguageModel({ unit: 'char' })
       characters.addSentence('ab')
       expect(characters.sentences).toEqual([['a', 'b']])
     })
@@ -178,6 +186,7 @@ describe('LanguageModel', function () {
       // P(unknown) = 0.75 * 4 / 5 * 1 / 5 = 0.12 and P(unknown | a) = 0.75 * 0.12
       expect(model.probability('zzz')).toBeCloseTo(0.12, 12)
       expect(model.probability('zzz', ['a'])).toBeCloseTo(0.09, 12)
+      expect(model.probability(UNK, ['a'])).toBe(model.probability('zzz', ['a']))
       // P(</s> | a) backs off entirely: 0.75 * 0.37
       expect(model.probability(END, ['a'])).toBeCloseTo(0.2775, 12)
     })
@@ -276,7 +285,7 @@ describe('LanguageModel', function () {
     })
 
     it('supports character models', function () {
-      const model = new LanguageModel({ n: 2, mode: 'character' })
+      const model = new LanguageModel({ n: 2, unit: 'char' })
       model.addSentence('ab')
       model.addSentence('ab')
       model.addSentence('ac')
@@ -284,6 +293,72 @@ describe('LanguageModel', function () {
       expect(model.vocabulary()).toEqual(['</s>', 'a', 'b', 'c'])
       expect(model.probability('b', ['a'])).toBeGreaterThan(model.probability('c', ['a']))
       expect(model.logProbability('ab')).toBeGreaterThan(model.logProbability('ac'))
+    })
+  })
+
+  describe('minCount', function () {
+    // Sentences a b and a c with minCount 2: only a is kept, b and c become <unk>.
+    // Bigram counts: (<s> a) 2, (a <unk>) 2, (<unk> </s>) 2
+    // Continuation counts: a 1, <unk> 1, </s> 1 (total 3, 3 types); vocabulary a, </s> (size 2)
+    let model
+    beforeEach(function () {
+      model = new LanguageModel({ n: 2, minCount: 2 })
+      model.addSentence(['a', 'b'])
+      model.addSentence(['a', 'c'])
+      model.train()
+    })
+
+    it('keeps only tokens seen at least minCount times in the vocabulary', function () {
+      expect(model.vocabulary()).toEqual(['</s>', 'a'])
+      expect(model.sentences).toEqual([['a', 'b'], ['a', 'c']])
+    })
+
+    it('replaces rare training tokens by the unknown symbol', function () {
+      // P(<unk>) = (1 - 0.75) / 3 + 0.75 * 3 / 3 * 1 / 3 = 1 / 3
+      expect(model.probability(UNK)).toBeCloseTo(1 / 3, 12)
+      // P(<unk> | a) = (2 - 0.75) / 2 + 0.75 * 1 / 2 * 1 / 3 = 0.75
+      expect(model.probability(UNK, ['a'])).toBeCloseTo(0.75, 12)
+      expect(model.probability('b', ['a'])).toBeCloseTo(0.75, 12)
+      expect(model.probability('never-seen', ['a'])).toBeCloseTo(0.75, 12)
+      expect(model.probability('a', ['a'])).toBeCloseTo(0.125, 12)
+      expect(model.probability(END, ['a'])).toBeCloseTo(0.125, 12)
+    })
+
+    it('scores unknown context tokens as the unknown symbol', function () {
+      // P(</s> | <unk>) = (2 - 0.75) / 2 + 0.75 * 1 / 2 * 1 / 3 = 0.75
+      expect(model.probability(END, ['b'])).toBeCloseTo(0.75, 12)
+      expect(model.probability(END, ['never-seen'])).toBe(model.probability(END, [UNK]))
+    })
+
+    it('distributes exactly one unit of probability mass per context', function () {
+      expect(totalMass(model, [])).toBeCloseTo(1, 12)
+      expect(totalMass(model, ['a'])).toBeCloseTo(1, 12)
+      expect(totalMass(model, ['b'])).toBeCloseTo(1, 12)
+    })
+
+    it('keeps tokens that reach the threshold exactly', function () {
+      const threshold = new LanguageModel({ n: 1, minCount: 3 })
+      threshold.addSentence(['x', 'x', 'y', 'y', 'y'])
+      threshold.train()
+      expect(threshold.vocabulary()).toEqual(['</s>', 'y'])
+      expect(threshold.probability('x')).toBe(threshold.probability(UNK))
+      expect(threshold.probability('y')).toBeGreaterThan(threshold.probability('x'))
+    })
+
+    it('changes nothing with the default minCount of 1', function () {
+      const plain = new LanguageModel({ n: 2 })
+      plain.addSentence(['a', 'b'])
+      plain.addSentence(['a', 'c'])
+      plain.train()
+      expect(plain.vocabulary()).toEqual(['</s>', 'a', 'b', 'c'])
+      expect(plain.probability('b', ['a'])).toBeCloseTo(0.2525, 12)
+    })
+
+    it('survives serialisation', function () {
+      const copy = LanguageModel.restore(JSON.parse(JSON.stringify(model)))
+      expect(copy.minCount).toBe(2)
+      expect(copy.vocabulary()).toEqual(['</s>', 'a'])
+      expect(copy.probability('b', ['a'])).toBe(model.probability('b', ['a']))
     })
   })
 
@@ -298,7 +373,7 @@ describe('LanguageModel', function () {
 
     it('serialises the options, the training state and copies of the sentences', function () {
       const json = model.toJSON()
-      expect(json).toEqual({ n: 2, discount: 0.5, mode: 'word', trained: true, sentences: [['a', 'b'], ['a', 'c']] })
+      expect(json).toEqual({ n: 2, discount: 0.5, unit: 'word', minCount: 1, trained: true, sentences: [['a', 'b'], ['a', 'c']] })
       expect(JSON.parse(JSON.stringify(model))).toEqual(json)
       json.sentences[0][0] = 'changed'
       json.sentences.push(['x'])
@@ -318,11 +393,11 @@ describe('LanguageModel', function () {
     })
 
     it('restores an untrained model as untrained', function () {
-      const untrained = new LanguageModel({ mode: 'character' })
+      const untrained = new LanguageModel({ unit: 'char' })
       untrained.addSentence('ab')
       const copy = LanguageModel.restore(untrained.toJSON())
       expect(copy.trained).toBe(false)
-      expect(copy.mode).toBe('character')
+      expect(copy.unit).toBe('char')
       expect(copy.sentences).toEqual([['a', 'b']])
       expect(copy.probability('a')).toBe(1)
       copy.train()

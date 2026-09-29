@@ -1,12 +1,12 @@
 diff --git a/lib/natural/classifiers/index.d.ts b/lib/natural/classifiers/index.d.ts
-index f05c8c7..7bacb7d 100644
+index f05c8c7..a28c1a2 100644
 --- a/lib/natural/classifiers/index.d.ts
 +++ b/lib/natural/classifiers/index.d.ts
 @@ -2,6 +2,7 @@ import events from 'events'
  import type { Corpus, Sentence } from '../brill_pos_tagger'
  import type { Stemmer } from '../stemmers'
  import type { StorageBackend } from '../util'
-+import type { LanguageModel, LanguageModelJSON, LanguageModelMode, LanguageModelOptions } from '../language_model'
++import type { LanguageModel, LanguageModelJSON, LanguageModelOptions, LanguageModelUnit } from '../language_model'
  
  // Start apparatus declarations
  
@@ -49,7 +49,7 @@ index f05c8c7..7bacb7d 100644
 +}
 +
 +declare interface LanguageModelClassifierJSON {
-+  options: { n: number, discount: number, mode: LanguageModelMode }
++  options: { n: number, discount: number, unit: LanguageModelUnit, minCount: number }
 +  keepStops: boolean
 +  docs: LanguageModelClassifierDoc[]
 +  features: Record<string, number>
@@ -60,18 +60,18 @@ index f05c8c7..7bacb7d 100644
 +declare type LanguageModelClassifierCallback = (err: NodeJS.ErrnoException | null, classifier?: LanguageModelClassifier) => void
 +
 +/**
-+ * Classifier with one Kneser-Ney language model per label. Text is not stemmed: the stemmer
-+ * argument only exists for compatibility with the other classifiers.
++ * Classifier with one Kneser-Ney language model per label. Text is never stemmed: the stemmer
++ * parameter of load and loadFrom only exists for compatibility with the other classifiers.
 + */
 +export class LanguageModelClassifier extends ClassifierBase {
-+  readonly options: { readonly n: number, readonly discount: number, readonly mode: LanguageModelMode }
++  readonly options: { readonly n: number, readonly discount: number, readonly unit: LanguageModelUnit, readonly minCount: number }
 +  models: Map<string, LanguageModel>
 +
-+  constructor (stemmer?: Stemmer | null, options?: LanguageModelClassifierOptions)
++  constructor (options?: LanguageModelClassifierOptions)
 +  setOptions (options: LanguageModelClassifierOptions): void
 +  tokenize (text: string): string[]
 +  toJSON (): LanguageModelClassifierJSON
-+  static restore (classifier: LanguageModelClassifierJSON, stemmer?: Stemmer | null): LanguageModelClassifier
++  static restore (classifier: LanguageModelClassifierJSON): LanguageModelClassifier
 +  static load (filename: string, stemmer: Stemmer | null | undefined, callback: LanguageModelClassifierCallback): void
 +  saveTo (storage: StorageBackend): Promise<string>
 +  static loadFrom (key: string, stemmer: Stemmer | null | undefined, storage: StorageBackend): Promise<LanguageModelClassifier>
@@ -92,10 +92,10 @@ index a5fb250..b0bf773 100644
  exports.Context = require('./maxent/Context')
 diff --git a/lib/natural/classifiers/language_model_classifier.js b/lib/natural/classifiers/language_model_classifier.js
 new file mode 100644
-index 0000000..49a4cc1
+index 0000000..c905503
 --- /dev/null
 +++ b/lib/natural/classifiers/language_model_classifier.js
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,268 @@
 +/*
 +Copyright (c) 2025
 +
@@ -123,12 +123,12 @@ index 0000000..49a4cc1
 +const Classifier = require('./classifier')
 +const LanguageModel = require('../language_model/language_model')
 +
-+const MODEL_OPTION_KEYS = ['n', 'discount', 'mode']
++const MODEL_OPTION_KEYS = ['n', 'discount', 'unit', 'minCount']
 +
 +// Validates language model options and returns the normalised values
 +function readModelOptions (options) {
 +  const model = new LanguageModel(options)
-+  return { n: model.n, discount: model.discount, mode: model.mode }
++  return { n: model.n, discount: model.discount, unit: model.unit, minCount: model.minCount }
 +}
 +
 +function sameTokens (a, b) {
@@ -154,19 +154,19 @@ index 0000000..49a4cc1
 +
 +// Classifier that trains one Kneser-Ney language model per label and classifies text by the
 +// posterior probability of each label (the label's prior times the probability of the text
-+// under the label's model). Unlike the other classifiers, text is not stemmed: the stemmer
-+// argument is accepted for API compatibility only and tokens are used as they are.
++// under the label's model). Unlike the other classifiers, text is never stemmed: tokens are used
++// as they are, and the stemmer parameter of load and loadFrom is accepted for compatibility only.
 +class LanguageModelClassifier extends Classifier {
-+  // options: { n, discount, mode } (see LanguageModel) plus the base keepStops option
-+  constructor (stemmer, options) {
-+    super(null, stemmer)
++  // options: { n, discount, unit, minCount } (see LanguageModel) plus the base keepStops option
++  constructor (options) {
++    super(null)
 +    this.features = Object.create(null)
 +    this.options = readModelOptions(options)
 +    this.models = new Map()
 +  }
 +
-+  // n, discount and mode can be set until the classifier is trained; mode can only be set while
-+  // no documents have been added, because documents are tokenised when they are added.
++  // n, discount, unit and minCount can be set until the classifier is trained; unit can only be
++  // set while no documents have been added, because documents are tokenised when they are added.
 +  setOptions (options) {
 +    if (options === null || typeof options !== 'object') {
 +      throw new TypeError('options must be an object')
@@ -184,17 +184,17 @@ index 0000000..49a4cc1
 +      return
 +    }
 +    if (this.models.size > 0) {
-+      throw new Error('n, discount and mode cannot be changed after training; create a new classifier instead')
++      throw new Error('n, discount, unit and minCount cannot be changed after training; create a new classifier instead')
 +    }
 +    const next = readModelOptions(Object.assign({}, this.options, requested))
-+    if (next.mode !== this.options.mode && this.docs.length > 0) {
-+      throw new Error('mode cannot be changed once documents have been added')
++    if (next.unit !== this.options.unit && this.docs.length > 0) {
++      throw new Error('unit cannot be changed once documents have been added')
 +    }
 +    this.options = next
 +  }
 +
 +  tokenize (text) {
-+    return LanguageModel.tokenize(text, this.options.mode)
++    return LanguageModel.tokenize(text, this.options.unit)
 +  }
 +
 +  toTokens (text) {
@@ -332,12 +332,12 @@ index 0000000..49a4cc1
 +  }
 +
 +  // Builds an independent classifier from the output of toJSON()
-+  static restore (classifier, stemmer) {
++  static restore (classifier) {
 +    if (classifier === null || typeof classifier !== 'object' ||
 +        !Array.isArray(classifier.docs) || !Array.isArray(classifier.models)) {
 +      throw new TypeError('classifier must be an object created by LanguageModelClassifier#toJSON')
 +    }
-+    const restored = new LanguageModelClassifier(stemmer, classifier.options)
++    const restored = new LanguageModelClassifier(classifier.options)
 +    restored.keepStops = !!classifier.keepStops
 +    restored.docs = classifier.docs.map(doc => ({ label: doc.label, text: restored.toTokens(doc.text) }))
 +    restored.features = Object.assign(Object.create(null), classifier.features)
@@ -346,18 +346,20 @@ index 0000000..49a4cc1
 +    return restored
 +  }
 +
++  // The stemmer has the same position as in the other classifiers and is ignored
 +  static load (filename, stemmer, callback) {
 +    Classifier.load(filename, stemmer, function (err, classifier) {
 +      if (err) {
 +        return callback(err)
 +      }
-+      callback(err, LanguageModelClassifier.restore(classifier, stemmer))
++      callback(err, LanguageModelClassifier.restore(classifier))
 +    })
 +  }
 +
++  // The stemmer has the same position as in the other classifiers and is ignored
 +  static async loadFrom (key, stemmer, storageBackend) {
 +    const classifier = await Classifier.loadFrom(key, storageBackend)
-+    return LanguageModelClassifier.restore(classifier, stemmer)
++    return LanguageModelClassifier.restore(classifier)
 +  }
 +}
 +
@@ -388,10 +390,10 @@ index f88d7cc..b66ad57 100644
    require('./phonetics'),
 diff --git a/lib/natural/language_model/index.d.ts b/lib/natural/language_model/index.d.ts
 new file mode 100644
-index 0000000..073f00d
+index 0000000..8ee227c
 --- /dev/null
 +++ b/lib/natural/language_model/index.d.ts
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,67 @@
 +/*
 +Copyright (c) 2025
 +
@@ -414,21 +416,24 @@ index 0000000..073f00d
 +THE SOFTWARE.
 +*/
 +
-+export type LanguageModelMode = 'word' | 'character'
++export type LanguageModelUnit = 'word' | 'char'
 +
 +export interface LanguageModelOptions {
 +  /** Order of the model (default 3) */
 +  n?: number
 +  /** Kneser-Ney discount between 0 and 1 (default 0.75) */
 +  discount?: number
-+  /** How strings are split into tokens (default 'word') */
-+  mode?: LanguageModelMode
++  /** How strings are split into tokens: words or characters (default 'word') */
++  unit?: LanguageModelUnit
++  /** Tokens seen fewer than minCount times become the unknown symbol (default 1) */
++  minCount?: number
 +}
 +
 +export interface LanguageModelJSON {
 +  n: number
 +  discount: number
-+  mode: LanguageModelMode
++  unit: LanguageModelUnit
++  minCount: number
 +  trained: boolean
 +  sentences: string[][]
 +}
@@ -436,15 +441,17 @@ index 0000000..073f00d
 +export declare class LanguageModel {
 +  static readonly START_SYMBOL: string
 +  static readonly END_SYMBOL: string
++  static readonly UNKNOWN_SYMBOL: string
 +
 +  readonly n: number
 +  readonly discount: number
-+  readonly mode: LanguageModelMode
++  readonly unit: LanguageModelUnit
++  readonly minCount: number
 +  readonly sentences: ReadonlyArray<readonly string[]>
 +  readonly trained: boolean
 +
 +  constructor (options?: LanguageModelOptions)
-+  static tokenize (text: string, mode?: LanguageModelMode): string[]
++  static tokenize (text: string, unit?: LanguageModelUnit): string[]
 +  tokenize (text: string): string[]
 +  addSentence (sentence: string | string[]): boolean
 +  train (): void
@@ -487,10 +494,10 @@ index 0000000..7e782ce
 +exports.LanguageModel = require('./language_model')
 diff --git a/lib/natural/language_model/language_model.js b/lib/natural/language_model/language_model.js
 new file mode 100644
-index 0000000..5a120c2
+index 0000000..d68251e
 --- /dev/null
 +++ b/lib/natural/language_model/language_model.js
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,357 @@
 +/*
 +Copyright (c) 2025
 +
@@ -519,17 +526,21 @@ index 0000000..5a120c2
 +
 +// Interpolated Kneser-Ney n-gram language model.
 +//
++// Tokens seen fewer than minCount times in the training data are replaced by the unknown symbol.
 +// Sentences are padded with n - 1 start symbols and one end symbol. Every n-gram of the padded
 +// sentences is counted. The lower-order distributions use continuation counts (the number of
 +// distinct left extensions of an n-gram), derived from the counts of the next higher order.
 +// The unigram distribution is interpolated with a uniform distribution over the vocabulary plus
-+// one slot for unknown words, so every word has a non-zero probability once the model is trained.
++// the unknown symbol, so every word has a non-zero probability once the model is trained. Words
++// that are not in the vocabulary are scored as the unknown symbol.
 +
 +const START_SYMBOL = '<s>'
 +const END_SYMBOL = '</s>'
-+const MODES = ['word', 'character']
++const UNKNOWN_SYMBOL = '<unk>'
++const UNITS = ['word', 'char']
 +const DEFAULT_N = 3
 +const DEFAULT_DISCOUNT = 0.75
++const DEFAULT_MIN_COUNT = 1
 +
 +const wordTokenizer = new WordTokenizer()
 +
@@ -611,11 +622,15 @@ index 0000000..5a120c2
 +  if (typeof discount !== 'number' || !(discount >= 0 && discount <= 1)) {
 +    throw new RangeError('discount must be a number between 0 and 1')
 +  }
-+  const mode = options.mode === undefined ? 'word' : options.mode
-+  if (!MODES.includes(mode)) {
-+    throw new RangeError('mode must be one of ' + MODES.join(', '))
++  const unit = options.unit === undefined ? 'word' : options.unit
++  if (!UNITS.includes(unit)) {
++    throw new RangeError('unit must be one of ' + UNITS.join(', '))
 +  }
-+  return { n, discount, mode }
++  const minCount = options.minCount === undefined ? DEFAULT_MIN_COUNT : options.minCount
++  if (!Number.isInteger(minCount) || minCount < 1) {
++    throw new RangeError('minCount must be an integer greater than or equal to 1')
++  }
++  return { n, discount, unit, minCount }
 +}
 +
 +function copyTokens (tokens) {
@@ -628,12 +643,13 @@ index 0000000..5a120c2
 +}
 +
 +class LanguageModel {
-+  // options: { n, discount, mode }, see normaliseOptions for the defaults
++  // options: { n, discount, unit, minCount }, see normaliseOptions for the defaults
 +  constructor (options) {
 +    const settings = normaliseOptions(options)
 +    this.n = settings.n
 +    this.discount = settings.discount
-+    this.mode = settings.mode
++    this.unit = settings.unit
++    this.minCount = settings.minCount
 +    this.sentences = []
 +    this.trained = false
 +    this.counts = null
@@ -641,25 +657,25 @@ index 0000000..5a120c2
 +    this.vocab = new Set()
 +  }
 +
-+  // Splits text into tokens: words for mode 'word', code points for mode 'character'
-+  static tokenize (text, mode) {
++  // Splits text into tokens: words for unit 'word', code points for unit 'char'
++  static tokenize (text, unit) {
 +    if (typeof text !== 'string') {
 +      throw new TypeError('text must be a string')
 +    }
-+    if (mode === undefined) {
-+      mode = 'word'
++    if (unit === undefined) {
++      unit = 'word'
 +    }
-+    if (mode === 'character') {
++    if (unit === 'char') {
 +      return Array.from(text)
 +    }
-+    if (mode === 'word') {
++    if (unit === 'word') {
 +      return wordTokenizer.tokenize(text)
 +    }
-+    throw new RangeError('mode must be one of ' + MODES.join(', '))
++    throw new RangeError('unit must be one of ' + UNITS.join(', '))
 +  }
 +
 +  tokenize (text) {
-+    return LanguageModel.tokenize(text, this.mode)
++    return LanguageModel.tokenize(text, this.unit)
 +  }
 +
 +  // Turns a sentence (string or array of tokens) into a token array the model owns
@@ -686,18 +702,31 @@ index 0000000..5a120c2
 +
 +  // (Re)builds the counts from all sentences added so far
 +  train () {
-+    const counts = new CountTrie()
++    // The vocabulary: tokens seen at least minCount times, plus the end symbol
++    const frequencies = new Map()
++    for (const sentence of this.sentences) {
++      for (const token of sentence) {
++        frequencies.set(token, (frequencies.get(token) || 0) + 1)
++      }
++    }
 +    const vocab = new Set()
++    for (const [token, frequency] of frequencies) {
++      if (frequency >= this.minCount) {
++        vocab.add(token)
++      }
++    }
++    if (this.sentences.length > 0) {
++      vocab.add(END_SYMBOL)
++    }
++    const known = token => (vocab.has(token) ? token : UNKNOWN_SYMBOL)
++
++    const counts = new CountTrie()
 +    const starts = new Array(this.n - 1).fill(START_SYMBOL)
 +    for (const sentence of this.sentences) {
-+      const padded = starts.concat(sentence, [END_SYMBOL])
++      const padded = starts.concat(sentence.map(known), [END_SYMBOL])
 +      for (let i = this.n - 1; i < padded.length; i++) {
 +        counts.add(padded.slice(i - this.n + 1, i + 1))
 +      }
-+      for (const token of sentence) {
-+        vocab.add(token)
-+      }
-+      vocab.add(END_SYMBOL)
 +    }
 +
 +    // Continuation counts: the number of distinct left extensions of each lower-order n-gram
@@ -718,9 +747,18 @@ index 0000000..5a120c2
 +    this.trained = true
 +  }
 +
++  // Maps a token that is not in the vocabulary to the unknown symbol; padding symbols pass through
++  normaliseToken (token) {
++    if (token === START_SYMBOL || token === END_SYMBOL || this.vocab.has(token)) {
++      return token
++    }
++    return UNKNOWN_SYMBOL
++  }
++
 +  // Probability of word given the preceding tokens. Only the last n - 1 tokens of the context are
 +  // used. A shorter context is scored with the corresponding lower-order distribution; pass
-+  // LanguageModel.START_SYMBOL tokens explicitly to score the beginning of a sentence.
++  // LanguageModel.START_SYMBOL tokens explicitly to score the beginning of a sentence. Words and
++  // context tokens outside the vocabulary are scored as the unknown symbol.
 +  probability (word, context) {
 +    if (typeof word !== 'string') {
 +      throw new TypeError('word must be a string')
@@ -740,7 +778,7 @@ index 0000000..5a120c2
 +      return this.uniform()
 +    }
 +    const history = context.length > this.n - 1 ? context.slice(context.length - (this.n - 1)) : context
-+    return this.interpolated(word, history)
++    return this.interpolated(this.normaliseToken(word), history.map(token => this.normaliseToken(token)))
 +  }
 +
 +  uniform () {
@@ -773,7 +811,7 @@ index 0000000..5a120c2
 +    return logProbability
 +  }
 +
-+  // Sorted list of the tokens seen during training (including the end symbol)
++  // Sorted list of the tokens kept during training (including the end symbol)
 +  vocabulary () {
 +    return Array.from(this.vocab).sort()
 +  }
@@ -782,7 +820,8 @@ index 0000000..5a120c2
 +    return {
 +      n: this.n,
 +      discount: this.discount,
-+      mode: this.mode,
++      unit: this.unit,
++      minCount: this.minCount,
 +      trained: this.trained,
 +      sentences: this.sentences.map(sentence => sentence.slice())
 +    }
@@ -797,7 +836,7 @@ index 0000000..5a120c2
 +    if (!Array.isArray(json.sentences)) {
 +      throw new TypeError('json.sentences must be an array of token arrays')
 +    }
-+    const model = new LanguageModel({ n: json.n, discount: json.discount, mode: json.mode })
++    const model = new LanguageModel({ n: json.n, discount: json.discount, unit: json.unit, minCount: json.minCount })
 +    for (const sentence of json.sentences) {
 +      if (!Array.isArray(sentence)) {
 +        throw new TypeError('json.sentences must be an array of token arrays')
@@ -813,6 +852,7 @@ index 0000000..5a120c2
 +
 +LanguageModel.START_SYMBOL = START_SYMBOL
 +LanguageModel.END_SYMBOL = END_SYMBOL
++LanguageModel.UNKNOWN_SYMBOL = UNKNOWN_SYMBOL
 +
 +module.exports = LanguageModel
 diff --git a/lib/natural/spellcheck/index.d.ts b/lib/natural/spellcheck/index.d.ts
